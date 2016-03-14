@@ -1,7 +1,9 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Newtonsoft.Json.Linq;
+using PushSharp.Core;
+using Telligent.Evolution.Components;
 using Telligent.Evolution.Extensibility.Version1;
 using Telligent.Evolution.Extensibility.Content.Version1;
 using Telligent.DynamicConfiguration.Components;
@@ -10,10 +12,8 @@ using Telligent.Evolution.Extensibility.Api.Entities.Version1;
 using Telligent.Evolution.Mobile.PushNotifications.Services;
 using Telligent.Evolution.Mobile.PushNotifications.Model;
 using Telligent.Evolution.Extensibility.Rest.Version2;
-using PushSharp;
-using PushSharp.Android;
+using PushSharp.Google;
 using PushSharp.Apple;
-using System.IO;
 
 namespace Telligent.Evolution.Mobile.PushNotifications
 {
@@ -24,7 +24,9 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 		IPluginConfiguration _configuration;
 		IDeviceRegistrationService _deviceRegistrationService = ServiceLocator.Get<IDeviceRegistrationService>();
 		IDeviceRegistrationDataService _deviceRegistrationDataService = ServiceLocator.Get<IDeviceRegistrationDataService>();
-		PushBroker _push = null;
+        ApnsServiceBroker _pushApple = null;
+	    GcmServiceBroker _pushGoogle = null;
+
 		DeviceType _enabledDevices = DeviceType.None;
 
 		#region IPlugin Members
@@ -36,12 +38,6 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 
 		public void Initialize()
 		{
-			_push = new PushBroker();
-			_push.OnDeviceSubscriptionExpired += push_OnDeviceSubscriptionExpired;
-			_push.OnChannelException += _push_OnChannelException;
-			_push.OnNotificationFailed += _push_OnNotificationFailed;
-			_push.OnServiceException += _push_OnServiceException;
-
 			_enabledDevices = DeviceType.None;
 
 			StringBuilder debug = new StringBuilder();
@@ -51,13 +47,17 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 				if (!string.IsNullOrEmpty(_configuration.GetCustom("apnsCertificate"))
 					&& !string.IsNullOrEmpty(_configuration.GetString("apnsPassword")))
 				{
-					var certificate = Telligent.Evolution.Mobile.PushNotifications.PropertyControls.CertificatePropertyControl.Deserialize(_configuration.GetCustom("apnsCertificate"));
+					var certificate = PropertyControls.CertificatePropertyControl.Deserialize(_configuration.GetCustom("apnsCertificate"));
 					if (certificate != null)
 					{
 						try
 						{
-							_push.RegisterAppleService(new ApplePushChannelSettings(_configuration.GetBool("apnsProduction"), certificate.Content, _configuration.GetString("apnsPassword"), false));
+                            _pushApple = new ApnsServiceBroker(new ApnsConfiguration(_configuration.GetBool("apnsProduction") ? ApnsConfiguration.ApnsServerEnvironment.Production : ApnsConfiguration.ApnsServerEnvironment.Sandbox , certificate.Content, _configuration.GetString("apnsPassword")));
+
 							_enabledDevices |= DeviceType.IOS;
+
+                            _pushApple.OnNotificationFailed += OnNotificationFailed;
+
 							debug.Append("iOS notifications are configured and enabled.\n");
 						}
 						catch (Exception ex)
@@ -79,8 +79,12 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 				{
 					try
 					{
-						_push.RegisterGcmService(new GcmPushChannelSettings(_configuration.GetString("gcmSenderId"), _configuration.GetString("gcmAuthorizationKey"), _configuration.GetString("gcmPackageName")));
-						_enabledDevices |= DeviceType.Android;
+                        _pushGoogle = new GcmServiceBroker(new GcmConfiguration(_configuration.GetString("gcmSenderId"), _configuration.GetString("gcmAuthorizationKey"), _configuration.GetString("gcmPackageName")));
+
+					    _pushGoogle.OnNotificationFailed += OnNotificationFailed;
+
+                        _enabledDevices |= DeviceType.Android;
+
 						debug.Append("Android notifications are configured and enabled.\n");
 					}
 					catch (Exception ex)
@@ -98,26 +102,26 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 			}			
 		}
 
-		void _push_OnServiceException(object sender, Exception error)
-		{
-			new Telligent.Evolution.Components.CSException(Telligent.Evolution.Components.CSExceptionType.UnknownError, "A Service Exception occurred while sending a push notification", error).Log();
-		}
+        private void OnNotificationFailed(INotification notification , string deviceToken, AggregateException exception)
+        {
+            if (notification.IsDeviceRegistrationIdValid())
+            {
+                new CSException(CSExceptionType.UnknownError, "An exception occurred while sending a apple push notification", exception).Log();
+                
+            }
 
-		void _push_OnNotificationFailed(object sender, PushSharp.Core.INotification notification, Exception error)
-		{
-			new Telligent.Evolution.Components.CSException(Telligent.Evolution.Components.CSExceptionType.UnknownError, "An exception occurred while sending a push notification", error).Log();
-		}
+            _deviceRegistrationService.UnregisterDevice(deviceToken);
+        }
+        
+        private void OnNotificationFailed(GcmNotification notification, AggregateException exception)
+        {
+            OnNotificationFailed(notification, notification.CollapseKey, exception);
+        }
 
-		void _push_OnChannelException(object sender, PushSharp.Core.IPushChannel pushChannel, Exception error)
-		{
-			new Telligent.Evolution.Components.CSException(Telligent.Evolution.Components.CSExceptionType.UnknownError, "A Channel Exception occurred while sending a push notification", error).Log();
-		}
-
-		void push_OnDeviceSubscriptionExpired(object sender, string expiredSubscriptionId, DateTime expirationDateUtc, PushSharp.Core.INotification notification)
-		{
-			if (!string.IsNullOrEmpty(expiredSubscriptionId))
-				_deviceRegistrationService.UnregisterDevice(expiredSubscriptionId);
-		}
+	    private void OnNotificationFailed(ApnsNotification notification, AggregateException exception)
+	    {
+            OnNotificationFailed(notification, notification.DeviceToken, exception);
+	    }
 
 		public string Name
 		{
@@ -253,18 +257,19 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 							if (enableLogging)
 								debug.Append("Sending to Google...\n");
 
-							_push.QueueNotification(
-								new GcmNotification()
-									.ForDeviceRegistrationId(device.Token)
-									.WithJson(string.Concat(
-										"{\"message\":\"",
-										System.Web.HttpUtility.JavaScriptStringEncode(message, false),
-										"\",\"msgcnt\":",
-										unreadCount.ToString("#####"),
-										",\"n\":\"",
-										notificationId,
-										"\"}"))
-								);
+                            _pushGoogle.QueueNotification(new GcmNotification()
+                            {
+                                CollapseKey = device.Token,
+                                ContentAvailable = true,
+                                Data = JObject.Parse(string.Concat(
+                                        "{\"message\":\"",
+                                        System.Web.HttpUtility.JavaScriptStringEncode(message, false),
+                                        "\",\"msgcnt\":",
+                                        unreadCount.ToString("#####"),
+                                        ",\"n\":\"",
+                                        notificationId,
+                                        "\"}"))
+                            });
 
 							distributed = true;
 						}
@@ -273,14 +278,13 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 							if (enableLogging)
 								debug.Append("Sending to Apple...\n");
 
-							_push.QueueNotification(
-								new AppleNotification()
-									.ForDeviceToken(device.Token)
-									.WithCustomItem("n", notificationId)
-									.WithAlert(message)
-									.WithBadge(unreadCount)
-									.WithSound("default")
-								);
+                            _pushApple.QueueNotification(new ApnsNotification(device.Token)
+                            {
+                                Payload = JObject.Parse (string.Format("{{ \"aps\" : " +
+                                                                       "{{ \"alert\" : \"{0}\" , \"sound\" : \"default\" , \"badge\":\"{1}\"}} " +
+                                                                       string.Format("{{ \"n\" : \"{0}\" }}", notificationId) +
+                                                                       "}}", message,unreadCount))
+                            });
 
 							distributed = true;
 						}
@@ -296,7 +300,7 @@ namespace Telligent.Evolution.Mobile.PushNotifications
 			if (enableLogging && debug.Length > 0)
 			{
 				debug.Append("Distributed: ").Append(distributed);
-				Telligent.Evolution.Extensibility.Api.Version1.PublicApi.Eventlogs.Write(debug.ToString(), new EventLogEntryWriteOptions { Category = "Push Notifications", EventId = 1234, EventType = "Information" });
+				PublicApi.Eventlogs.Write(debug.ToString(), new EventLogEntryWriteOptions { Category = "Push Notifications", EventId = 1234, EventType = "Information" });
 			}
 
 			return distributed;

@@ -113,7 +113,11 @@ namespace Telligent.Evolution.Mobile.Web
 				return false;
 			}
 
-			public byte[] GetBinaryFileContents(string fileName)
+		    public bool UseCacheDependencies {
+		        get { return false; } 
+		    }
+
+		    public byte[] GetBinaryFileContents(string fileName)
 			{
 				return new byte[0];
 			}
